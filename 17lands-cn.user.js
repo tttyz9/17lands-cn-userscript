@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         17Lands 中文卡图替换 + 卡组构筑器
 // @namespace    https://github.com/tttyz9/17lands-cn-userscript
-// @version      0.30
-// @description  卡图中文替换 + 卡组构筑器(原始卡图/堆叠展开/深浅切换) + TTS牌表导出 + 卡图打印
+// @version      0.42
+// @description  卡图中文替换 + 卡组构筑器 + 牌表导出 + 卡图打印
 // @author       阿T
 // @match        https://www.17lands.com/*
 // @match        https://17lands.com/*
@@ -25,7 +25,6 @@
 // ==/UserScript==
 
 
-
 (function() {
     'use strict';
 
@@ -36,7 +35,7 @@
     // ================================================================
     function mcIsOurs(err) {
         const s = (err && (err.stack || err.message || String(err))) || '';
-        return /mtgcn|mc-|fetchDraftPool|openBuilder|buildUI|rerender|renderCard|renderStats|injectButtons|webpToPng|exportWord|exportTTS|gmFetch/.test(s);
+        return /mtgcn|mc-|fetchDraftPool|openBuilder|buildUI|rerender|renderCard|renderStats|injectButtons|webpToPng|exportWord|exportTTS|gmFetch|collectTokens|scryGet/.test(s);
     }
     function mcShowErr(where, err) {
         console.error('[17Lands-CN] ' + where + ':', err);
@@ -117,7 +116,7 @@
     function saveMeta() { try { GM_setValue('mtgcn_meta_cache_v1', JSON.stringify(CARDS)); } catch (e) {} }
     function cardOf(key) {
         if (CARDS[key]) return CARDS[key];
-        if (key.indexOf('name::') === 0) return { uuid: '', name: key.slice(6), set: '', cmc: 0, colors: [], type_line: '', img: '' };
+        if (key.indexOf('name::') === 0) return { uuid: '', name: key.slice(6), set: '', cmc: 0, colors: [], type_line: 'Land', img: '' };
         return { name: '(未知)', cmc: 0, colors: [], type_line: '', img: '' };
     }
     // 基本地名称集合（images.mtgch.com/zhs 无中文卡图，需回退 Scryfall 原图）
@@ -125,6 +124,12 @@
     function isBasicLand(key) {
         const c = cardOf(key);
         return BASIC_LANDS.has(c.name) || BASIC_LANDS.has(key.replace(/^name::/, ''));
+    }
+    // 所有地（含非基本地）：按 type_line 含 land 或卡名为基本地
+    function isLand(key) {
+        const c = cardOf(key);
+        const t = (c.type_line || '').toLowerCase();
+        return t.includes('land') || isBasicLand(key);
     }
     // 基本地 UUID 集合：从卡牌数据接口收集（参考 v0.1 思路——按卡名判断基本地，不替换其卡图）
     const BASIC_UUIDS = new Set();
@@ -213,8 +218,10 @@
     // ================================================================
     //  模块 2 — 拉取轮抓卡池
     // ================================================================
-    async function fetchDraftPool(draftId) {
-        const r = await gmFetch(DATA_URL + draftId);
+    async function fetchDraftPool(draftId, seat) {
+        let url = DATA_URL + draftId;
+        if (seat && /^[0-9]+$/.test(String(seat))) url += '&seat=' + encodeURIComponent(seat);
+        const r = await gmFetch(url);
         const data = JSON.parse(r.responseText);
         const expansion = data.expansion || 'LTR';
         // 清空旧系列基本地缓存（避免跨系列串图），稍后预取本次系列的全部 5 种基本地
@@ -289,15 +296,17 @@
             const m = a.getAttribute('href').match(REPLAY_RE);
             if (!m) return;
             a._mtgcnBtn = true;
+            const seat = new URL(a.href, location.href).searchParams.get('seat');
             const btn = document.createElement('button');
             btn.className = 'mc-build-btn';
             btn.dataset.draftId = m[1];
+            if (seat) btn.dataset.seat = seat;
             btn.innerHTML = '<span class="mc-bspin"></span><span>构筑牌组</span>';
             btn.onclick = (e) => {
                 e.preventDefault(); e.stopPropagation();
                 if (btn.classList.contains('is-loading')) return;
                 btn.classList.add('is-loading');
-                openBuilder(m[1]).finally(() => btn.classList.remove('is-loading'));
+                openBuilder(m[1], seat).finally(() => btn.classList.remove('is-loading'));
             };
             a.after(btn);
         });
@@ -305,14 +314,23 @@
     new MutationObserver(() => { try { injectButtons(); } catch (e) {} }).observe(document.documentElement, { childList: true, subtree: true });
 
     // ================================================================
-    //  模块 4 — 卡组构筑器（原始卡图 · 堆叠展开 · 深浅主题切换）
+    //  模块 4 — MTGA Possible Maindeck 风格构筑器（原始卡图 · 堆叠展开 · 深浅主题切换）
     // ================================================================
     // 数据模型：main = Array<{key,col}>（每张卡为独立实例，col=显示列0..7，可跨列自由拖拽/同列重排），side = Array<{key,n}>，pool = Array<{key}>
-    let STATE = { main: [], side: [], pool: [], lands: { Plains: 0, Island: 0, Swamp: 0, Mountain: 0, Forest: 0 }, landSet: 'LTR', mainSort: 'cmc', poolSort: 'cmc' };
+    let STATE = { main: [], side: [], pool: [], lands: { Plains: 0, Island: 0, Swamp: 0, Mountain: 0, Forest: 0 }, landSet: 'LTR', mainSort: 'cmc', poolSort: 'cmc', includeTokens: true };
     let CUR_DRAFT = null;
     let FILTERS = { colors: [], cmc: 'all', type: 'all', q: '' };
     let DRAG = null; // {key, zone, entry}
     let CARD_SCALE = 1; // 卡图缩放系数（滑块控制）
+    // 兜底：拖拽若被打断（拖出窗口 / 按 ESC / 浏览器失焦），卡片的 dragend 可能不触发，
+    // 导致 DRAG 卡死 → 之后所有卡图 hover 被 `if (DRAG) return` 拦截，悬浮放大再也不显示。
+    // 用全局监听强制清空（只挂一次）。
+    if (!window.__mtgcnDragGuard) {
+        window.__mtgcnDragGuard = true;
+        document.addEventListener('dragend', () => { DRAG = null; }, true);
+        document.addEventListener('drop',   () => { DRAG = null; }, true);
+        window.addEventListener('blur',    () => { DRAG = null; });
+    }
 
     function deckKey(id) { return 'mtgcn_deck_' + id; }
     function loadState(id) {
@@ -450,24 +468,37 @@
             d.appendChild(mi); d.appendChild(m); d.appendChild(pl); landsEl.appendChild(d);
         });
     }
-    // 自动配置地卡：按主牌非地牌的颜色比例分配各色地，并扣除已存在于主牌里的地（避免重复）
+    // 自动配置地卡：按主牌非地牌的颜色符号数量 + 曲线权重分配各色地，并扣除已存在于主牌里的地（避免重复）
     function autoLand(totalLands) {
         const TOTAL = Math.max(0, Math.min(40, totalLands | 0));
-        // 颜色需求权重（来自非地主牌各卡标注的颜色）
+        // 已存在于主牌里的所有地（基本地+非基本地）都要从目标总数中扣除，避免重复
+        const existingLandCount = STATE.main.filter(x => isLand(x.key)).length;
+        const targetBasics = Math.max(0, TOTAL - existingLandCount);
+        // 颜色需求权重：按费用中实际颜色符号计数，并给低费咒语更高权重（因为它们更早需要颜色）
         const w = { W: 0, U: 0, B: 0, R: 0, G: 0 };
         STATE.main.forEach(x => {
-            if (isBasicLand(x.key)) return;
-            (cardOf(x.key).colors || []).forEach(c => { if (w[c] !== undefined) w[c]++; });
+            if (isLand(x.key)) return;
+            const c = cardOf(x.key);
+            if (!c.mana_cost) return;
+            // 曲线因子：1费≈1.75，2费≈1.5，3费≈1.25，5费≈0.75，高费递减
+            const factor = Math.min(2.0, Math.max(0.6, 2.0 - (c.cmc || 0) * 0.25));
+            const re = /\{([^}]+)\}/g; let m;
+            while ((m = re.exec(c.mana_cost))) {
+                const s = m[1].toUpperCase();
+                if (/^[WUBRG]$/.test(s)) w[s] += factor;
+                else if (/^[WUBRG]\/[WUBRG]$/.test(s)) s.split('/').forEach(col => { if (w[col] !== undefined) w[col] += factor * 0.5; });
+                else if (/^[WUBRG]\/P$/.test(s)) { if (w[s[0]] !== undefined) w[s[0]] += factor * 0.5; }
+            }
         });
-        // 已存在于主牌里的地（按可产颜色统计）—— 这些「已能生产的费用」要扣除，不重复配置
+        // 已存在于主牌里的基本地（按可产颜色统计）—— 这些「已能生产的费用」要扣除，不重复配置
         const have = { W: 0, U: 0, B: 0, R: 0, G: 0 };
         STATE.main.forEach(x => { if (isBasicLand(x.key)) { const c = LAND_COLOR[cardOf(x.key).name]; if (c) have[c]++; } });
         const sumW = Object.values(w).reduce((a, b) => a + b, 0);
         let targets;
-        if (sumW > 0) targets = allocate(w, TOTAL);
+        if (sumW > 0) targets = allocate(w, targetBasics);
         else {
             const sumHave = Object.values(have).reduce((a, b) => a + b, 0);
-            targets = sumHave > 0 ? allocate(have, TOTAL) : allocate({ W: 1, U: 1, B: 1, R: 1, G: 1 }, TOTAL);
+            targets = sumHave > 0 ? allocate(have, targetBasics) : allocate({ W: 1, U: 1, B: 1, R: 1, G: 1 }, targetBasics);
         }
         // 应用净增/净减
         ['W', 'U', 'B', 'R', 'G'].forEach(c => {
@@ -499,7 +530,7 @@
         return 0;
     }
 
-    // —— 卡组构筑器：原始卡图渲染 ——
+    // —— MTGA Possible Maindeck 风格：原始卡图渲染 ——
     // 同名多张 = 多张独立卡图（不合并）；相邻同名卡堆叠（扑克牌效果）
     // 只显示原始中文 webp 卡图（自带完整卡框：卡名/费用/类型/描述）
     function renderCard(key, n, zone, entry, stackOffset) {
@@ -515,12 +546,12 @@
         // 堆叠偏移（同名第2张起向上偏移，露出下面卡的边缘）— 偏移量由 CSS .mc-stacked 按缩放比例计算
         if (stackOffset > 0) { card.classList.add('mc-stacked'); }
         // hover 金色高亮 + 浮出大图预览（拖拽中不显示）
-        card.addEventListener('mouseenter', () => showPreview(card));
-        card.addEventListener('mouseleave', hidePreview);
+        card.addEventListener('mouseenter', () => { if (DRAG) return; showHoverZoom(imgFor(card.dataset.key), 'card', card.getBoundingClientRect(), [370 * CARD_SCALE, 518 * CARD_SCALE]); });
+        card.addEventListener('mouseleave', hideHoverZoom);
         // HTML5 拖拽
         card.draggable = true;
         card.addEventListener('dragstart', (e) => {
-            hidePreview(); // 拖拽开始时立即隐藏大图
+            hideHoverZoom(); // 拖拽开始时立即隐藏大图
             DRAG = { key, zone, entry: entry || null };
             e.dataTransfer.effectAllowed = 'move';
             e.dataTransfer.setData('text/plain', key);
@@ -530,32 +561,49 @@
         return card;
     }
 
-    // —— 悬浮放大卡图（大图，金色边框，默认显示在卡图右侧）——
-    function showPreview(host) {
-        if (DRAG) return; // 拖拽中不显示预览
+    // —— 悬浮放大卡图：构筑器卡图 + token 弹窗小图 共用同一套逻辑 ——
+    // 仅存在一个全局浮层 #mc-hover-zoom，避免重复实现。
+    let _mcHz = null;
+    function mcHoverEl() {
+        // 若浮层被移除（buildUI 在切换历史/座位时会删 #mc-hover-zoom）而 _mcHz 仍指向游离节点，
+        // 需重建并重新挂回 document.body，否则 hover 大图永远显示不出来。
+        if (!_mcHz || !document.body.contains(_mcHz)) {
+            if (_mcHz && _mcHz.parentNode) _mcHz.parentNode.removeChild(_mcHz);
+            _mcHz = document.createElement('div');
+            _mcHz.id = 'mc-hover-zoom';
+            _mcHz.innerHTML = '<img>';
+            document.body.appendChild(_mcHz);
+        }
+        return _mcHz;
+    }
+    // mode: 'card' 锚定到 rect（默认卡图右侧）；'mouse' 跟随鼠标 event
+    function showHoverZoom(src, mode, ref, size) {
         try {
-            const r = host.getBoundingClientRect();
-            if (!r || r.width === 0) return; // 宿主不可见则跳过
-            let layer = document.getElementById('mc-hover-preview');
-            if (!layer) {
-                layer = document.createElement('div'); layer.id = 'mc-hover-preview';
-                layer.innerHTML = '<img>'; document.body.appendChild(layer);
-            }
-            const key = host.dataset.key;
-            const img = layer.querySelector('img');
-            img.src = imgFor(key);
-            const W = 264 * CARD_SCALE, H = 370 * CARD_SCALE; // 随缩放同步
-            layer.style.width = W + 'px'; layer.style.height = H + 'px';
-            let x = r.right + 12;            // 默认贴在卡图右侧
-            let y = r.top;                   // 顶部对齐
-            if (x + W > window.innerWidth - 8) x = r.left - W - 12; // 右边放不下 → 翻到左侧
-            if (x < 8) x = 8;
-            if (y + H > window.innerHeight - 8) y = window.innerHeight - H - 8; // 底部夹住
-            if (y < 8) y = 8;
-            layer.style.left = x + 'px'; layer.style.top = y + 'px'; layer.style.display = 'block';
+            const el = mcHoverEl();
+            el.querySelector('img').src = src;
+            if (size) { el.style.width = size[0] + 'px'; el.style.height = size[1] + 'px'; }
+            el.style.display = 'block';
+            posHoverZoom(el, mode, ref);
         } catch (e) { /* 静默忽略预览异常 */ }
     }
-    function hidePreview() { const l = document.getElementById('mc-hover-preview'); if (l) l.style.display = 'none'; }
+    function posHoverZoom(el, mode, ref) {
+        const w = el.offsetWidth, h = el.offsetHeight;
+        let x, y;
+        if (mode === 'mouse') {
+            const e = ref;
+            x = e.clientX + 18; y = e.clientY - h / 2;
+            if (x + w > window.innerWidth - 8) x = e.clientX - w - 18; // 右侧放不下翻到左侧
+        } else {
+            const r = ref;
+            x = r.right + 12; y = r.top;                              // 默认贴在卡图右侧
+            if (x + w > window.innerWidth - 8) x = r.left - w - 12;   // 右侧放不下翻到左侧
+        }
+        if (x < 8) x = 8;
+        if (y < 8) y = 8;
+        if (y + h > window.innerHeight - 8) y = window.innerHeight - h - 8; // 底部夹住
+        el.style.left = x + 'px'; el.style.top = y + 'px';
+    }
+    function hideHoverZoom() { if (_mcHz) _mcHz.style.display = 'none'; }
     function poolTakeOne(entry) {
         if (!entry) return;
         const i = STATE.pool.indexOf(entry);
@@ -633,7 +681,8 @@
             if (t.includes('creature')) types.Creature++; else if (t.includes('instant')) types.Instant++; else if (t.includes('sorcery')) types.Sorcery++;
             else if (t.includes('artifact')) types.Artifact++; else if (t.includes('enchantment')) types.Enchantment++; else if (t.includes('land')) types.Land++; else types.Other++;
         });
-        const landN = Object.values(STATE.lands).reduce((a, b) => a + b, 0);
+        // 地张数：所有 type_line 含 land 的卡（包括轮抓中抓到的非基本地，如多色地/神器地）
+        const landN = mainCards.filter(c => (c.type_line || '').toLowerCase().includes('land')).length;
         const nonLandN = Math.max(0, mainCount - landN);
         const total = mainCount + arrCount(STATE.side);
         const warn = (total > 0 && total !== 40);
@@ -704,13 +753,13 @@
         renderStats(root.querySelector('#mc-stats'));
     }
 
-    async function openBuilder(draftId) {
+    async function openBuilder(draftId, seat) {
         // 每次全新开始：不读本地存档，清空 STATE
-        STATE = { main: [], side: [], pool: [], lands: { Plains: 0, Island: 0, Swamp: 0, Mountain: 0, Forest: 0 }, landSet: 'LTR', mainSort: 'cmc', poolSort: 'cmc' };
+        STATE = { main: [], side: [], pool: [], lands: { Plains: 0, Island: 0, Swamp: 0, Mountain: 0, Forest: 0 }, landSet: 'LTR', mainSort: 'cmc', poolSort: 'cmc', includeTokens: true };
         CUR_DRAFT = draftId;
         showLoading('正在拉取轮抓卡池…');
         try {
-            const { pool, expansion } = await fetchDraftPool(draftId);
+            const { pool, expansion } = await fetchDraftPool(draftId, seat);
             STATE.landSet = expansion;
             Object.keys(pool).forEach(k => {
                 if (arrFind(STATE.main, k) < 0 && arrFind(STATE.side, k) < 0) {
@@ -726,13 +775,14 @@
 
     function buildUI() {
         let root = document.getElementById('mtgcn-builder'); if (root) root.remove();
-        // 清理上一次的悬浮预览层（避免切换历史后预览失效）
-        const oldPreview = document.getElementById('mc-hover-preview');
+        // 清理上一次的悬浮预览层（避免切换历史/座位后预览失效）
+        const oldPreview = document.getElementById('mc-hover-zoom');
         if (oldPreview) oldPreview.remove();
+        _mcHz = null; // 同步清空模块级引用，否则 mcHoverEl 会返回已脱离文档的游离节点导致 hover 失效
         root = document.createElement('div'); root.id = 'mtgcn-builder';
         root.innerHTML = `
 <style>
-/* ===== 卡组构筑器 — 主题变量 + 原始卡图网格 + 深浅切换 ===== */
+/* ===== MTGA Possible Maindeck — 主题变量 + 原始卡图网格 + 深浅切换 ===== */
 #mtgcn-builder{position:fixed;inset:0;z-index:2147483647;
   --bg:#1a1a1c;--bg2:#222;--bg3:#252528;--bg4:#2a2a2d;--bg5:#1e1e20;
   --fg:#ccc;--fg2:#e0e0e0;--fg3:#fff;--sub:#888;--accent:#3C3489;--accent2:#534AB7;
@@ -744,15 +794,27 @@
   --bg:#f4f4f7;--bg2:#fff;--bg3:#EEEDFE;--bg4:#f8f8fb;--bg5:#fafafc;
   --fg:#222;--fg2:#333;--fg3:#000;--sub:#666;--accent:#3C3489;--accent2:#534AB7;
   --border:#e0e0e6;--border2:#d0d0da;--hover-bg:#534AB7;--warn:#993C1D}
-#mc-top{background:var(--accent);color:#fff;padding:8px 14px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-#mc-top b{font-size:15px;margin-right:auto}
-#mc-top button{background:#fff;color:var(--accent);border:0;border-radius:4px;padding:5px 10px;cursor:pointer}
-#mc-top .x{background:#712B13;color:#fff}
-#mc-top #mc-theme-btn{background:var(--bg2);color:var(--fg2)}
+/* 容器内所有 label 清除默认/继承 margin（含 17lands 全局 label margin-bottom），统一紧凑对齐 */
+#mtgcn-builder label{margin:0}
+#mc-top{background:var(--accent);color:#fff;padding:6px 12px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;min-height:44px}
+#mc-top b{font-size:15px;margin-right:auto;flex-shrink:0;display:flex;align-items:center}
+/* 顶栏控件严格统一（按钮 / 缩放滑块 / 含指示物复选框 同高同圆角同背景） */
+.mc-top-btn,.mc-top-range,.mc-top-check{box-sizing:border-box;display:inline-flex;align-items:center;justify-content:center;height:32px;min-height:32px;padding:0 12px;font-size:12px;font-weight:600;border:0;border-radius:8px;white-space:nowrap;vertical-align:middle;cursor:pointer;background:#fff;color:var(--accent);box-shadow:0 1px 3px rgba(0,0,0,.18);transition:filter .15s,transform .05s;margin:0}
+.mc-top-btn:hover,.mc-top-range:hover,.mc-top-check:hover{filter:brightness(1.05)}
+.mc-top-btn:active,.mc-top-range:active,.mc-top-check:active{transform:translateY(1px)}
+.mc-top-btn.x{background:#712B13;color:#fff}
+.mc-top-range{gap:5px}
+.mc-top-range input[type=range]{width:80px;height:6px;margin:0;padding:0;accent-color:var(--accent);cursor:pointer}
+.mc-top-range span{min-width:38px;text-align:right}
+.mc-top-check{gap:5px}
+.mc-top-check input[type=checkbox]{width:15px;height:15px;margin:0;padding:0;accent-color:var(--accent);cursor:pointer}
+#mc-theme-btn{background:#fff;color:var(--accent)}
 /* 筛选栏 */
 #mc-filters{display:flex;gap:6px;flex-wrap:wrap;padding:6px 10px;background:var(--bg2);border-bottom:1px solid var(--border);align-items:center}
 #mc-filters b{color:var(--sub)}
 #mc-filters input,#mc-filters select{font-size:12px;padding:3px;background:var(--bg4);color:var(--fg);border:1px solid var(--border2)}
+#mc-filters label{display:inline-flex;align-items:center;gap:3px;font-size:12px;color:var(--fg);cursor:pointer}
+#mc-filters input[type=checkbox]{width:14px;height:14px;margin:0;accent-color:var(--accent)}
 /* 三列布局 */
 #mc-main-row{flex:1;display:flex;overflow:hidden}
 #mc-cols{flex:1;display:grid;grid-template-columns:200px 1fr 200px;gap:6px;padding:6px;overflow:hidden}
@@ -763,12 +825,12 @@
 .mc-list{flex:1;overflow:auto;padding:10px;display:flex;flex-wrap:wrap;gap:6px;align-content:flex-start;background:var(--bg5)}
 /* 主牌：按费用 8 列（0..7+）曲线棋盘，每列独立拖拽区，列内可自由拖拽排序 */
 #mc-main-cols{flex:1;display:flex;gap:4px;overflow:auto;padding:6px;background:var(--bg5);align-items:stretch}
-.mc-mcol{display:flex;flex-direction:column;width:calc(120px*var(--mc-scale));flex-shrink:0;background:var(--bg2);border:1px solid var(--border);border-radius:6px;overflow:hidden}
+.mc-mcol{display:flex;flex-direction:column;width:calc(168px*var(--mc-scale));flex-shrink:0;background:var(--bg2);border:1px solid var(--border);border-radius:6px;overflow:hidden}
 .mc-mcol-h{text-align:center;font-weight:bold;padding:3px;background:var(--bg3);color:var(--accent);border-bottom:1px solid var(--border);font-size:12px}
 .mc-mcol-list{flex:1;overflow-y:auto;padding:6px;display:flex;flex-direction:column;gap:4px;align-items:center;min-height:60px}
-.mc-mcol-list .mc-card{width:calc(110px*var(--mc-scale));height:calc(154px*var(--mc-scale))}
+.mc-mcol-list .mc-card{width:calc(154px*var(--mc-scale));height:calc(216px*var(--mc-scale))}
 /* 单张卡：原始中文 webp 图片（带完整 MTG 卡框） */
-.mc-card{width:calc(120px*var(--mc-scale));height:calc(168px*var(--mc-scale));border-radius:5px;overflow:hidden;background:var(--bg4);
+.mc-card{width:calc(168px*var(--mc-scale));height:calc(235px*var(--mc-scale));border-radius:5px;overflow:hidden;background:var(--bg4);
   border:2px solid var(--border2);flex-shrink:0;cursor:grab;position:relative;
   box-shadow:0 2px 5px rgba(0,0,0,.35);
   transition:border-color .15s,box-shadow .15s,transform .12s,z-index .12s}
@@ -780,18 +842,17 @@
   transform:scale(1.05) translateY(-3px);z-index:100!important}
 .mc-card:active{cursor:grabbing}
 .mc-card.mc-dragging{opacity:.35;transform:scale(.96)}
-/* 堆叠：同名第2张起向上偏移 */
 /* 堆叠：同名第2张起向上偏移（紧凑，露出约 18% 边缘），随缩放同步 */
-.mc-card.mc-stacked{margin-top:calc(154px*var(--mc-scale)*-0.82)}
+.mc-card.mc-stacked{margin-top:calc(216px*var(--mc-scale)*-0.82)}
 /* drop indicator */
 .mc-drop-line{width:3px;align-self:stretch;background:#D4A843;border-radius:2px;margin:0 1px}
 
-/* 悬浮放大预览（大图，金色粗边框） */
-#mc-hover-preview{position:fixed;z-index:2147483649;pointer-events:none;
-  border:3px solid #D4A843;border-radius:8px;
+/* 悬浮放大预览（构筑器卡图 与 token 弹窗小图 共用一套逻辑，无金框） */
+#mc-hover-zoom{position:fixed;z-index:2147483652;pointer-events:none;
+  border:0;border-radius:8px;
   box-shadow:0 10px 40px rgba(0,0,0,.55);
-  background:var(--bg);display:none;overflow:hidden;width:264px;height:370px}
-#mc-hover-preview img{width:100%;height:100%;display:block;object-fit:contain}
+  background:var(--bg);display:none;overflow:hidden}
+#mc-hover-zoom img{width:100%;height:100%;display:block;object-fit:contain}
 
 /* 右栏统计面板 */
 #mc-side-panel{width:210px;background:var(--bg2);border-left:1px solid var(--border);padding:8px;overflow:auto;display:flex;flex-direction:column;gap:8px}
@@ -800,13 +861,13 @@
 .mc-stat-val{font-size:12px;color:var(--fg)}
 .mc-warn{color:var(--warn);font-weight:bold}
 /* 曲线：最高柱=满高，其余按“张数/最多张数”比例缩放；网格线按 1/4 等分（满高=最多张数） */
-.mc-curve{position:relative;display:flex;align-items:flex-end;gap:4px;height:234px;padding:0 2px 16px;background:var(--bg5);border-radius:4px}
+.mc-curve{position:relative;display:flex;align-items:flex-end;gap:4px;height:240px;padding:0 2px 22px;background:var(--bg5);border-radius:4px}
 .mc-cgrid{position:absolute;left:0;right:0;top:0;bottom:16px;
   background:repeating-linear-gradient(to top,transparent 0,transparent 49px,var(--border) 49px,var(--border) 50px);pointer-events:none}
 .mc-bar{position:relative;flex:1;height:218px;display:flex;flex-direction:column;align-items:center;justify-content:flex-end}
-.mc-bar-n{font-size:10px;color:var(--fg3);font-weight:700;margin-bottom:2px;z-index:1}
+.mc-bar-n{font-size:10px;color:var(--fg3);font-weight:700;margin-bottom:6px;z-index:1}
 .mc-bar-fill{width:72%;max-width:20px;background:linear-gradient(to top,#3C3489,#534AB7);border-radius:3px 3px 0 0;min-height:2px;transition:height .2s}
-.mc-bar-x{position:absolute;bottom:-15px;font-size:10px;color:var(--sub)}
+.mc-bar-x{position:absolute;bottom:-20px;font-size:10px;color:var(--sub)}
 .mc-curve-note{float:right;font-size:10px;color:var(--sub);font-weight:normal}
 /* 颜色点 */
 .mc-colors{display:flex;gap:3px}
@@ -831,12 +892,13 @@
 .mc-panel-h{font-size:12px;font-weight:bold;cursor:pointer;color:var(--accent);padding:4px;border-bottom:1px solid var(--border)}
 </style>
 <div id="mc-top"><b>卡组构筑器 · draft <span id="mc-did"></span></b>
-  <button id="mc-theme-btn">🌙 深色</button>
-  <label style="background:#fff;color:var(--accent);border-radius:4px;padding:4px 8px;display:flex;align-items:center;gap:6px;font-size:12px;cursor:default">卡图 <input type="range" id="mc-zoom" min="0.6" max="1.6" step="0.05" value="1" style="width:96px;vertical-align:middle"> <span id="mc-zoom-val" style="min-width:34px;text-align:right">100%</span></label>
-  <button id="mc-allin">一键全入主牌</button>
-  <button id="mc-tts">导出TTS牌表</button>
-  <button id="mc-word">导出Word卡图</button>
-  <button class="x" id="mc-close">关闭</button></div>
+  <button id="mc-theme-btn" class="mc-top-btn">🌙 深色</button>
+  <label class="mc-top-range">卡图 <input type="range" id="mc-zoom" min="0.6" max="1.6" step="0.05" value="1"> <span id="mc-zoom-val">100%</span></label>
+  <label class="mc-top-check">含指示物 <input type="checkbox" id="mc-inc-tokens" checked></label>
+  <button id="mc-allin" class="mc-top-btn">一键全入主牌</button>
+  <button id="mc-tts" class="mc-top-btn">导出牌表</button>
+  <button id="mc-word" class="mc-top-btn">打印卡图</button>
+  <button id="mc-close" class="mc-top-btn x">关闭</button></div>
 <div id="mc-filters"><b>筛选:</b>
   <label><input type="checkbox" value="W">白</label><label><input type="checkbox" value="U">蓝</label>
   <label><input type="checkbox" value="B">黑</label><label><input type="checkbox" value="R">红</label><label><input type="checkbox" value="G">绿</label>
@@ -960,6 +1022,8 @@
 
         root.querySelector('#mc-tts').onclick = exportTTS;
         root.querySelector('#mc-word').onclick = exportWord;
+        const incTok = root.querySelector('#mc-inc-tokens');
+        if (incTok) incTok.onchange = (e) => { STATE.includeTokens = e.target.checked; };
     }
 
     // ================================================================
@@ -1004,7 +1068,7 @@
             return out;
         }
         const out = part(STATE.main, '主牌') + '\n' + part(STATE.side, '备牌');
-        download(out, 'deck_' + (CUR_DRAFT || '').slice(0, 8) + '_tts.txt', 'text/plain');
+        download(out, 'deck_' + (CUR_DRAFT || '').slice(0, 8) + '_decklist.txt', 'text/plain');
     }
     if (typeof window !== 'undefined') window.__MC_EXPORT_CARDINFO = exportCardInfo;
 
@@ -1024,7 +1088,10 @@
     async function toPngDataUrl(imgUrl) {
         /* 将任意图片 URL 转为 PNG data URL (用于嵌入离线 HTML) */
         const r = await gmFetch(imgUrl, { responseType: 'arraybuffer' });
-        const blob = new Blob([r.response], { type: 'image/webp' });
+        // 用真实 content-type 建 blob（mtgch 是 webp，Scryfall 指示物是 jpg/png，误标会导致解码失败）
+        let ct = 'image/webp';
+        try { const m = String(r.responseHeaders || '').match(/content-type:\s*([^\s;]+)/i); if (m) ct = m[1]; } catch (e) {}
+        const blob = new Blob([r.response], { type: ct });
         const url = URL.createObjectURL(blob);
         try {
             const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
@@ -1034,31 +1101,157 @@
         } finally { URL.revokeObjectURL(url); }
     }
 
+    // —— 指示物(Token)收集：参考“TTS万智牌导出工具”的自动导入指示物 ——
+    // 每张非地卡在 Scryfall 的 all_parts 里带 component==="token" 的子卡，
+    // 这些就是该卡在游戏中会生成的指示物；按 token id 去重后抓取卡图，
+    // 在「导出Word卡图」时一并打印（带金色边框 + “指示物”角标，与参考站一致）。
+    let _scryLast = 0;
+    const _scryCache = new Map();
+    async function scryGet(url) {
+        // 轻量限流：两次请求间隔≥80ms，规避 Scryfall 429 限流
+        const wait = 80 - (Date.now() - _scryLast);
+        if (wait > 0) await new Promise(r => setTimeout(r, wait));
+        _scryLast = Date.now();
+        const r = await gmFetch(url);
+        return JSON.parse(r.responseText);
+    }
+    async function collectTokensForDeck() {
+        const out = [];           // { id, name, imgUrl, key }
+        const seen = new Set();
+        const keys = new Set();
+        STATE.main.forEach(x => keys.add(x.key));
+        STATE.side.forEach(x => keys.add(x.key));
+        for (const key of keys) {
+            if (isBasicLand(key)) continue;
+            const c = cardOf(key);
+            if (!c || !c.name || c.name === '(未知)') continue;
+            const cacheKey = c.set ? c.name + '|' + c.set : c.name;
+            let info = _scryCache.get(cacheKey);
+            if (info === undefined) {
+                try { info = await scryGet('https://api.scryfall.com/cards/named?exact=' + encodeURIComponent(c.name) + (c.set ? '&set=' + encodeURIComponent(c.set) : '')); }
+                catch (e) { info = false; }
+                _scryCache.set(cacheKey, info);
+            }
+            if (!info || !info.all_parts) continue;
+            for (const p of info.all_parts) {
+                if (p.component !== 'token' || !p.id || seen.has(p.id)) continue;
+                seen.add(p.id);
+                let t = null;
+                try { t = await scryGet('https://api.scryfall.com/cards/' + p.id); } catch (e) { continue; }
+                if (!t) continue;
+                const imgUrl = (t.image_uris && t.image_uris.normal) ||
+                    (t.card_faces && t.card_faces[0] && t.card_faces[0].image_uris && t.card_faces[0].image_uris.normal) || null;
+                if (imgUrl) out.push({ id: p.id, name: t.name || p.name, imgUrl, key: 'token::' + p.id });
+            }
+        }
+        return out;
+    }
+
+    // 选择指示物打印数量的弹窗（返回带 count 的 token 列表）
+    function chooseTokenCounts(tokens) {
+        return new Promise((resolve, reject) => {
+            const host = document.getElementById('mtgcn-builder') || document.body;
+            const overlay = document.createElement('div'); overlay.id = 'mc-token-overlay';
+            overlay.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:2147483650;display:flex;align-items:center;justify-content:center';
+            const box = document.createElement('div'); box.id = 'mc-token-modal';
+            box.style.cssText = 'background:var(--bg2,#fff);color:var(--fg,#222);border-radius:12px;padding:16px;max-width:min(560px,90vw);max-height:80vh;overflow:auto;box-shadow:0 12px 40px rgba(0,0,0,.5);font-family:system-ui,sans-serif;min-width:300px';
+            box.innerHTML = '<h3 style="margin:0 0 12px;font-size:15px">选择要打印的指示物数量</h3><div id="mc-token-list"></div>' +
+                '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px">' +
+                '<button id="mc-token-cancel" style="padding:6px 14px;border:0;border-radius:8px;background:#999;color:#fff;font-size:12px;font-weight:600;cursor:pointer">取消</button>' +
+                '<button id="mc-token-confirm" style="padding:6px 14px;border:0;border-radius:8px;background:var(--accent);color:#fff;font-size:12px;font-weight:600;cursor:pointer">确认打印</button></div>';
+            host.appendChild(overlay);
+            overlay.appendChild(box);
+            const list = box.querySelector('#mc-token-list');
+            tokens.forEach((t, i) => {
+                const row = document.createElement('div');
+                row.style.cssText = 'display:flex;align-items:center;gap:10px;margin:6px 0';
+                row.innerHTML = '<img src="' + t.imgUrl + '" style="width:48px;height:67px;object-fit:cover;border-radius:4px;border:1px solid var(--border,#ccc);flex-shrink:0;cursor:zoom-in">' +
+                    '<span style="flex:1;font-size:13px;color:var(--fg)">' + (t.name || '指示物') + '</span>' +
+                    '<input type="number" min="0" value="1" style="width:56px;text-align:center;font-size:13px;padding:2px;border:1px solid var(--border2,#ccc);border-radius:4px;background:var(--bg4);color:var(--fg)" data-idx="' + i + '">';
+                list.appendChild(row);
+                const img = row.querySelector('img');
+                img.addEventListener('mouseenter', (e) => showHoverZoom(t.imgUrl, 'mouse', e, [220, 308]));
+                img.addEventListener('mousemove', (e) => { if (_mcHz && _mcHz.style.display !== 'none') posHoverZoom(_mcHz, 'mouse', e); });
+                img.addEventListener('mouseleave', hideHoverZoom);
+            });
+            const close = () => { hideHoverZoom(); overlay.remove(); };
+            box.querySelector('#mc-token-cancel').onclick = () => { close(); reject('cancelled'); };
+            box.querySelector('#mc-token-confirm').onclick = () => {
+                const inputs = box.querySelectorAll('input[type=number]');
+                const out = [];
+                inputs.forEach((inp, i) => { out.push(Object.assign({}, tokens[i], { count: parseInt(inp.value, 10) || 0 })); });
+                close(); resolve(out);
+            };
+        });
+    }
+
     async function exportWord() {
         // ---- 收集主牌全部卡（统一来源：STATE.main，与 TTS 完全一致）----
-        // exportCardInfo 为每张卡解析出统一信息：基本地取 BASIC_IMG（按系列预取），非基本地取 imgFor
         const list = [];
-        STATE.main.forEach(x => { const info = exportCardInfo(x.key); list.push({ key: x.key, img: info.imgUrl }); });
-        if (!list.length) { alert('主牌为空，无法导出'); return; }
+        STATE.main.forEach(x => { const info = exportCardInfo(x.key); list.push({ key: x.key, img: info.imgUrl, isToken: false }); });
+        if (!list.length) { alert('主牌为空，无法打印'); return; }
 
         // ---- 进度提示 ----
         const status = document.createElement('div');
         status.style.cssText = 'position:fixed;bottom:10px;right:10px;background:#3C3489;color:#fff;padding:8px 12px;border-radius:6px;z-index:2147483649';
-        status.textContent = '准备卡图 0/' + list.length;
+        status.textContent = '准备卡图…';
         document.body.appendChild(status);
 
-        // ---- 去重 + 转 PNG data URL（全部内嵌进 HTML，离线可打印）----
-        const uniq = [...new Set(list.map(x => x.key))];
+        // ---- 已内嵌到 HTML 的图片缓存（token 会先进来，主牌卡图随后抓）----
         const pngMap = {};
-        for (let i = 0; i < uniq.length; i++) {
-            status.textContent = '抓取卡图 ' + (i + 1) + '/' + uniq.length;
-            const key = uniq[i];
-            const imgUrl = exportCardInfo(key).imgUrl;
-            if (!imgUrl || imgUrl.startsWith('data:')) continue;
+        let tokenCount = 0;
+
+        // ---- 若开启“含指示物”，收集本副牌会生成的 token 并让用户选择打印数量 ----
+        if (STATE.includeTokens) {
             try {
-                pngMap[key] = await toPngDataUrl(imgUrl);
-            } catch (e) { console.warn('[导出] 图失败', key, e); }
+                status.textContent = '正在查找指示物…';
+                const tokens = await collectTokensForDeck();
+                if (tokens.length > 0) {
+                    // 先把 token 卡图转为内嵌 PNG，避免弹窗中直接外链 Scryfall 导致图裂
+                    status.textContent = '正在抓取指示物卡图…';
+                    const tokenPngs = [];
+                    for (let i = 0; i < tokens.length; i++) {
+                        status.textContent = '抓取指示物卡图 ' + (i + 1) + '/' + tokens.length;
+                        const t = tokens[i];
+                        try { tokenPngs.push(Object.assign({}, t, { imgUrl: await toPngDataUrl(t.imgUrl) })); }
+                        catch (e) { console.warn('[导出] token 图失败', t.name, e); }
+                    }
+                    if (tokenPngs.length > 0) {
+                        status.textContent = '请选择指示物数量…';
+                        const chosen = await chooseTokenCounts(tokenPngs);
+                        chosen.forEach(t => {
+                            const cnt = Math.max(0, parseInt(t.count, 10) || 0);
+                            if (cnt > 0) {
+                                pngMap[t.key] = t.imgUrl; // token 已内嵌，直接入缓存
+                                for (let i = 0; i < cnt; i++) list.push({ key: t.key, img: t.imgUrl, isToken: true, name: t.name });
+                                tokenCount += cnt;
+                            }
+                        });
+                    }
+                }
+            } catch (e) {
+                if (e === 'cancelled') { status.textContent = '已取消打印'; setTimeout(() => status.remove(), 1000); return; }
+                console.warn('[导出] 指示物收集失败', e);
+            }
         }
+
+        // ---- 去重 + 转换主牌卡图（token 已提前写入 pngMap，此处不再重复处理）----
+        const imgMap = {};
+        list.forEach(x => { if (!imgMap[x.key]) imgMap[x.key] = x.img; });
+        const keys = Object.keys(imgMap);
+        const toFetch = keys.filter(k => !imgMap[k].startsWith('data:'));
+        for (let i = 0; i < toFetch.length; i++) {
+            status.textContent = '抓取卡图 ' + (i + 1) + '/' + toFetch.length;
+            const key = toFetch[i];
+            try {
+                pngMap[key] = await toPngDataUrl(imgMap[key]);
+            } catch (e) {
+                console.warn('[导出] 图转换失败，回退原图', key, e);
+                pngMap[key] = imgMap[key]; // 转换失败也用原图，避免空白
+            }
+        }
+        // 兜底：所有仍是 data: 的 key（只有 token）写进 pngMap
+        keys.forEach(k => { if (imgMap[k].startsWith('data:') && !pngMap[k]) pngMap[k] = imgMap[k]; });
         status.textContent = '生成打印页…';
 
         // ---- 构建完整打印 HTML（每页 9 张 3×3，@page 控制 A4 分页）----
@@ -1101,14 +1294,15 @@
 
         // ---- 下载 HTML 文件并自动打开 ----
         download(fullHtml, 'deck_' + (CUR_DRAFT || '').slice(0, 8) + '_cards.html', 'text/html');
-        status.textContent = '完成！已下载打印文件 (' + list.length + ' 张卡 / ' + totalPages + ' 页)';
+        const realCards = list.length - tokenCount;
+        status.textContent = '完成！已生成打印文件 (' + realCards + ' 张卡' + (tokenCount ? ' + ' + tokenCount + ' 指示物' : '') + ' / ' + totalPages + ' 页)';
         setTimeout(() => status.remove(), 3000);
 
-        alert('已下载打印文件！\n\n请打开下载的 .html 文件 → 浏览器会自动弹出打印对话框。\n选择 A4 纸、无边距打印即可得到 3×3 排列的卡牌页面。');
+        alert('已生成打印文件！\n\n主牌 ' + realCards + ' 张' + (tokenCount ? '，指示物 ' + tokenCount + ' 张' : '') + '。\n请打开下载的 .html 文件 → 浏览器会自动弹出打印对话框。\n选择 A4 纸、无边距打印即可得到 3×3 排列的卡牌页面。');
     }
 
     function showLoading(msg) { let l = document.getElementById('mc-loading'); if (!l) { l = document.createElement('div'); l.id = 'mc-loading'; l.innerHTML = '<div class="mc-spin"></div><div class="mc-msg"></div>'; document.body.appendChild(l); } l.querySelector('.mc-msg').textContent = msg || '加载中…'; }
     function hideLoading() { const l = document.getElementById('mc-loading'); if (l) l.remove(); }
 
-    console.log('%c[17Lands-CN] v0.30 已就绪 — 统一TTS/Word导出来源(新增exportCardInfo:基本地set=当前系列LTR/卡图=BASIC_IMG按系列预取;非基本地取CARDS元数据)·地卡带系列代码且绝不重复(修复v0.29地卡丢失set) · 卡图导出=打印级HTML(3×3/A4/真实MTG尺寸/自动打印) · 基本地数字同步(唯一真源) · 地卡管理(加/减地+自动配置颜色比例) · 主牌每张卡独立实例(跨列/同名自由拖拽) · 曲线保持 · 按钮转圈 · GM_xmlhttpRequest拉取', 'color:#3C3489;font-weight:bold');
+    console.log('%c[17Lands-CN] v0.42 — 修复「点开其他 seat 构筑牌组后卡图悬浮放大失效」(用户定位)：根因是 buildUI 在切换历史/座位时会 remove #mc-hover-zoom 浮层，却未清空模块级 _mcHz，使其仍指向已脱离文档的游离节点，mcHoverEl 的 if(!_mcHz) 判断误以为已存在→不再 appendChild→hover 大图永不可见。修复：mcHoverEl 增加 !document.body.contains(_mcHz) 判定，节点脱离文档即重建挂回；buildUI 删除浮层后同步 _mcHz=null。v0.41 的 DRAG 兜底保留(无害)。', 'color:#3C3489;font-weight:bold');
 })();
