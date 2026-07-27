@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         17Lands 中文卡图替换 + 卡组构筑器
 // @namespace    https://github.com/tttyz9/17lands-cn-userscript
-// @version      0.42
+// @version      0.43
 // @description  卡图中文替换 + 卡组构筑器 + 牌表导出 + 卡图打印
 // @author       阿T
 // @match        https://www.17lands.com/*
@@ -322,13 +322,16 @@
     let FILTERS = { colors: [], cmc: 'all', type: 'all', q: '' };
     let DRAG = null; // {key, zone, entry}
     let CARD_SCALE = 1; // 卡图缩放系数（滑块控制）
-    // 兜底：拖拽若被打断（拖出窗口 / 按 ESC / 浏览器失焦），卡片的 dragend 可能不触发，
-    // 导致 DRAG 卡死 → 之后所有卡图 hover 被 `if (DRAG) return` 拦截，悬浮放大再也不显示。
+    // 兜底：拖拽若被打断（拖出窗口 / 按 ESC / 浏览器失焦），DRAG 可能卡死 →
+    // 之后所有卡图 hover 被 `if (DRAG) return` 拦截，悬浮放大再也不显示。
     // 用全局监听强制清空（只挂一次）。
+    // 注意：只能挂在 dragend / blur 上，绝不能挂 drop 的捕获阶段——
+    // 容器的 drop 处理(handleDrop)是冒泡监听，若 document 在捕获阶段先 drop 清掉 DRAG，
+    // 容器拿到时 DRAG 已是 null → 落点处理被跳过 → 表现为「拖得动但松手没反应」。
+    // dragend 在 drop 之后才对源卡触发，用它清空不会干扰落点处理；且任何拖拽结束必触发 dragend。
     if (!window.__mtgcnDragGuard) {
         window.__mtgcnDragGuard = true;
         document.addEventListener('dragend', () => { DRAG = null; }, true);
-        document.addEventListener('drop',   () => { DRAG = null; }, true);
         window.addEventListener('blur',    () => { DRAG = null; });
     }
 
@@ -1304,5 +1307,5 @@
     function showLoading(msg) { let l = document.getElementById('mc-loading'); if (!l) { l = document.createElement('div'); l.id = 'mc-loading'; l.innerHTML = '<div class="mc-spin"></div><div class="mc-msg"></div>'; document.body.appendChild(l); } l.querySelector('.mc-msg').textContent = msg || '加载中…'; }
     function hideLoading() { const l = document.getElementById('mc-loading'); if (l) l.remove(); }
 
-    console.log('%c[17Lands-CN] v0.42 — 修复「点开其他 seat 构筑牌组后卡图悬浮放大失效」(用户定位)：根因是 buildUI 在切换历史/座位时会 remove #mc-hover-zoom 浮层，却未清空模块级 _mcHz，使其仍指向已脱离文档的游离节点，mcHoverEl 的 if(!_mcHz) 判断误以为已存在→不再 appendChild→hover 大图永不可见。修复：mcHoverEl 增加 !document.body.contains(_mcHz) 判定，节点脱离文档即重建挂回；buildUI 删除浮层后同步 _mcHz=null。v0.41 的 DRAG 兜底保留(无害)。', 'color:#3C3489;font-weight:bold');
+    console.log('%c[17Lands-CN] v0.43 — 修复「卡组构筑器无法拖拽卡牌」：根因是 v0.41 引入的拖拽兜底保护里，document 在【捕获阶段】监听全局 drop 并立即清空 DRAG，而容器的落点处理(handleDrop)是【冒泡阶段】监听，捕获阶段先执行 → 容器处理时 DRAG 已为 null → if(!DRAG) return 直接返回，松手落下被完全跳过（表现为拖得动、有插入线、但松手无效）。修复：删掉 drop 的捕获清空监听，仅保留 dragend(拖拽必触发、且在 drop 之后对源卡触发) + window blur 两处兜底清空，既修复落点、又不让 DRAG 卡死。', 'color:#3C3489;font-weight:bold');
 })();
